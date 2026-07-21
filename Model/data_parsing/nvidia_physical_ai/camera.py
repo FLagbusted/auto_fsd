@@ -1,8 +1,10 @@
 """Camera frame loading for the NVIDIA PhysicalAI-Autonomous-Vehicles dataset.
 
-TODO: The NVIDIA dataset does not include rendered map tiles. The 8th view is
-currently a zero tensor of shape (3, H, W). Replace ``_make_map_tile``
-with a real renderer once one is available.
+The dataset provides 7 real cameras. It has NO rendered map tile, so the map
+branch receives a zero tensor (``make_map_tile``) until a renderer is
+integrated. The map is NOT a camera view: it is kept out of ``visual_tiles`` (so
+it never enters the camera BEV projection) and routed to the model's separate
+map branch. Hence ``NUM_VIEWS = 7``.
 """
 
 from __future__ import annotations
@@ -13,9 +15,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from PIL import Image
 from physical_ai_av.video import SeekVideoReader
-from torchvision.transforms import Compose
 
 # Camera directories present in the NVIDIA PhysicalAI-Autonomous-Vehicles dataset.
 CAMERA_NAMES: list[str] = [
@@ -28,14 +28,15 @@ CAMERA_NAMES: list[str] = [
     "camera_rear_tele_30fov",
 ]
 
-# Total views fed to the model = 7 cameras + 1 map tile.
-NUM_VIEWS = 8
+# Real camera views fed to the BEV projection (the map is separate, not a view).
+NUM_VIEWS = 7
 
-def _make_map_tile(transform: Compose, reference: torch.Tensor) -> torch.Tensor:
-    """Return a zero map tile matching the shape of a transformed camera frame.
 
-    The transform is accepted for API consistency with the real renderer
-    that will replace this placeholder.
+def make_map_tile(reference: torch.Tensor) -> torch.Tensor:
+    """Return a zero map tile matching the shape/dtype of one raw camera frame.
+
+    NVIDIA has no rendered nav-map, so the map branch receives zeros for now.
+    Shaped like a single (3, H, W) frame for the model's map_input.
 
     TODO: Replace with a real renderer once a map source is integrated.
     """
@@ -64,15 +65,72 @@ def _egomotion_ts_to_frame_idx(
     """
     return int(np.argmin(np.abs(camera_timestamps_us - egomotion_timestamp_us)))
 
+def load_front_clip(
+    data_root: Path | str,
+    clip_uuid: str,
+    egomotion_timestamps_us: list[int],
+    front_cam: str | None = None,
+    camera_timestamps_us: np.ndarray | None = None,
+) -> list[torch.Tensor]:
+    """Decode ONLY the front camera at a list of egomotion timestamps (a clip).
+
+    For offline reasoning labeling the teacher needs a temporal FRONT-camera
+    clip (one frame per horizon), not all 7 cameras. This opens the front video
+    ONCE and decodes exactly the requested frames (one per timestamp), so a
+    5-horizon clip is a single-camera, 5-frame decode instead of 7-cam per frame.
+
+    Args:
+        data_root / clip_uuid: locate the video.
+        egomotion_timestamps_us: one egomotion timestamp per horizon (0/1/2/…s).
+        front_cam: front camera dir name (defaults to CAMERA_NAMES[0]).
+        camera_timestamps_us: pre-loaded front-cam timestamp array (optional).
+
+    Returns:
+        list of RAW uint8 ``[3, H, W]`` front frames, one per input timestamp.
+    """
+    data_root = Path(data_root)
+    front_cam = front_cam or CAMERA_NAMES[0]
+    cam_dir = data_root / "camera" / front_cam
+    video_path = cam_dir / f"{clip_uuid}.{front_cam}.mp4"
+    if not video_path.exists():
+        raise FileNotFoundError(f"Front camera video not found: {video_path}")
+
+    if camera_timestamps_us is None:
+        timestamps_path = cam_dir / f"{clip_uuid}.{front_cam}.timestamps.parquet"
+        if not timestamps_path.exists():
+            raise FileNotFoundError(
+                f"Front camera timestamps parquet not found: {timestamps_path}.")
+        camera_timestamps_us = pd.read_parquet(timestamps_path)["timestamp"].to_numpy()
+
+    frame_indices = np.array(
+        [_egomotion_ts_to_frame_idx(ts, camera_timestamps_us)
+         for ts in egomotion_timestamps_us],
+        dtype=np.int64,
+    )
+    video_data = io.BytesIO(video_path.read_bytes())
+    reader = SeekVideoReader(video_data=video_data)
+    try:
+        rgb_frames = reader.decode_images_from_frame_indices(frame_indices)
+    finally:
+        reader.close()
+    # RAW uint8 CHW per frame, no preprocessing.
+    return [torch.from_numpy(rgb_frames[i]).permute(2, 0, 1).contiguous()
+            for i in range(len(frame_indices))]
+
+
 def load_camera_frame(
     data_root: Path | str,
     clip_uuid: str,
     egomotion_timestamp_us: int,
-    transform: Compose,
     camera_names: list[str] | None = None,
     camera_timestamps: dict[str, np.ndarray] | None = None,
 ) -> torch.Tensor:
-    """Load and preprocess the camera frame aligned to an egomotion timestamp.
+    """Load the RAW camera frame aligned to an egomotion timestamp.
+
+    Returns the decoded frame as an unmodified uint8 CHW tensor — no resize,
+    crop or normalize. The dataset is a pre-extraction source: the shard packer
+    owns the single, explicit, geometry-aware resize and the loader owns the
+    single normalize, so the projection ABI targets a known frame (#77).
 
     Args:
         data_root: Root directory of the dataset subset.
@@ -83,10 +141,10 @@ def load_camera_frame(
             Defaults to ``CAMERA_NAMES``.
 
     Returns:
-        Float tensor of shape (8, 3, H, W):
-        7 camera views followed by 1 map tile (currently zeros).
+        uint8 tensor of shape (7, 3, H, W): the 7 real camera views. The nav-map
+        is not included here; see ``make_map_tile``.
     """
-    data_root = Path(data_root) 
+    data_root = Path(data_root)
     camera_root = data_root / "camera"
 
     if not camera_root.exists():
@@ -125,10 +183,8 @@ def load_camera_frame(
         finally:
             reader.close()
 
-        pil_frame = Image.fromarray(rgb_frames[0])
-        camera_tensors.append(transform(pil_frame))  # (3, H, W)
+        # RAW uint8 CHW, no preprocessing (see module/function docstring).
+        frame = torch.from_numpy(rgb_frames[0]).permute(2, 0, 1).contiguous()
+        camera_tensors.append(frame)
 
-    map_tile = _make_map_tile(transform, camera_tensors[0])  # (3, H, W)
-    camera_tensors.append(map_tile)
-
-    return torch.stack(camera_tensors, dim=0)  # (8, 3, H, W)
+    return torch.stack(camera_tensors, dim=0)  # (7, 3, H, W) uint8

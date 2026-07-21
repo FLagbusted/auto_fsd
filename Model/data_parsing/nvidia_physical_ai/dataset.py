@@ -14,7 +14,8 @@ Usage
     )
 
     sample = dataset[0]
-    # sample["visual_tiles"]       (8, 3, 256, 256)
+    # sample["visual_tiles"]       (7, 3, H, W) uint8  7 raw cameras (native res)
+    # sample["map_tile"]           (3, H, W) uint8     nav-map (zeros; map branch)
     # sample["visual_history"]     (896,)
     # sample["egomotion_history"]  (256,)
     # sample["trajectory_target"]  (128,)
@@ -28,13 +29,14 @@ import logging
 from pathlib import Path
 from typing import TypedDict
 
-import timm
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from .camera import CAMERA_NAMES, load_camera_frame
+from data_processing.contract_versions import UID_SCHEMA_VERSION
+
+from .camera import CAMERA_NAMES, load_camera_frame, make_map_tile
 from .egomotion import (
     _EGOMOTION_COLUMNS,
     MIN_ROWS,
@@ -55,7 +57,8 @@ _VISUAL_HISTORY_DIM = 896
 
 
 class ClipSample(TypedDict):
-    visual_tiles: torch.Tensor        # (8, 3, 256, 256)
+    visual_tiles: torch.Tensor        # (7, 3, H, W) uint8 — 7 raw cameras (native)
+    map_tile: torch.Tensor            # (3, H, W) uint8 — nav-map (zeros; map branch)
     visual_history: torch.Tensor      # (896,)
     egomotion_history: torch.Tensor   # (256,)
     trajectory_target: torch.Tensor   # (128,)
@@ -80,20 +83,30 @@ class NvidiaAVDataset(Dataset):
     def __init__(
         self,
         data_root: Path | str,
-        backbone_name: str = "swinv2_tiny_window8_256",
         camera_names: list[str] | None = None,
         clip_uuids: list[str] | None = None,
+        reasoning_clip_only: bool = False,
+        wm_num_frames: int = 4,
+        wm_stride: int = 10,
     ) -> None:
         self.data_root = Path(data_root)
         self.camera_names = camera_names or CAMERA_NAMES
+        # Reasoning-clip mode (#98): expose get_front_clip(idx) that decodes ONLY
+        # the front camera at the reasoning horizons (0/1/2/3/4 s = current +
+        # wm_num_frames future 1 Hz steps). wm_stride=10 turns the 10 Hz
+        # downsampled egomotion index into 1 Hz horizons — matching L2D. Sample
+        # enumeration is unchanged (egomotion margins 64/64 >> the horizon reach
+        # wm_num_frames*wm_stride=40), so sample_ids still JOIN with data_processing.
+        self._reasoning_clip_only = reasoning_clip_only
+        self._wm_num_frames = wm_num_frames
+        self._wm_stride = wm_stride
+        self._front_cam = (camera_names or CAMERA_NAMES)[0]
 
-        # Build the image transform from the backbone's own config so that
-        # preprocessing always matches what the backbone expects.
-        # create_model loads config only — no pretrained weights downloaded here.
-        _backbone = timm.create_model(backbone_name, pretrained=False)
-        data_config = timm.data.resolve_model_data_config(_backbone)
-        self.transform = timm.data.create_transform(**data_config, is_training=False)
-        del _backbone
+        # This is a pre-extraction source: __getitem__ returns RAW uint8 frames
+        # (no resize/crop/normalize, no timm/backbone dependency). The shard
+        # packer owns the single geometry-aware resize and the pre-extracted
+        # loader owns the single normalize, so the projection ABI targets a known
+        # frame and there is no double-normalize (#77).
 
         clips = clip_uuids if clip_uuids is not None else self._discover_clip_uuids()
         if not clips:
@@ -240,6 +253,95 @@ class NvidiaAVDataset(Dataset):
             for sample_idx in range(min_idx, max_idx + 1)
         ]
 
+    def projection_spec(self, image_size: int = 256) -> dict | None:
+        """Build a native f-theta projection spec from saved calibration.
+
+        Reads calibration/{intrinsics,extrinsics}.pkl (saved at ingest), builds
+        an FThetaProjection in the camera's NATIVE pixel frame for the camera
+        slot order, and serializes it for the shard manifest. ``image_size`` is
+        accepted for API symmetry but is irrelevant to f-theta: the operator
+        normalizes by the native (W, H), which is exact under any resize. Returns
+        None when calibration is absent, so the dataset falls back to the
+        explicit pseudo path (never a silent real-geometry claim). See #77.
+        """
+        import pickle
+
+        calib_dir = self.data_root / "calibration"
+        intr_path = calib_dir / "intrinsics.pkl"
+        extr_path = calib_dir / "extrinsics.pkl"
+        if not (intr_path.exists() and extr_path.exists()):
+            # No calibration on disk -> the pipeline runs the explicit pseudo
+            # path. Log it (WARNING) so a run never silently falls back to a
+            # learned prior while a reader assumes real f-theta geometry. The
+            # ingest step writes these pkls when calibration is downloaded.
+            logger.warning(
+                "NvidiaAVDataset.projection_spec: no calibration at %s "
+                "(intrinsics.pkl / extrinsics.pkl); using pseudo geometry. Run "
+                "data_ingest with camera_intrinsics/sensor_extrinsics for real "
+                "f-theta projection (#77).", calib_dir,
+            )
+            return None
+
+        from .calibration import build_ftheta_projection
+
+        with open(intr_path, "rb") as f:
+            intrinsics = pickle.load(f)
+        with open(extr_path, "rb") as f:
+            extrinsics = pickle.load(f)
+
+        proj = build_ftheta_projection(intrinsics, extrinsics, self.camera_names)
+        return proj.to_spec()
+
+    def get_front_clip(self, idx: int) -> list[torch.Tensor]:
+        """Front-camera clip at the reasoning horizons (0/1/2/…s) for sample idx.
+
+        Only valid when built with ``reasoning_clip_only=True``. Decodes ONLY the
+        front camera at ``NUM_HORIZONS`` egomotion timestamps (current + future
+        1 Hz steps), so it is a single-camera, few-frame decode. ``idx`` uses the
+        SAME sample index as ``__getitem__``/generate so the sample_id JOIN holds.
+        """
+        if not self._reasoning_clip_only:
+            raise RuntimeError(
+                "get_front_clip requires NvidiaAVDataset(reasoning_clip_only=True).")
+        from .camera import load_front_clip
+
+        clip_uuid, sample_idx, _ts = self._samples[idx]
+        df_ds = self._egomotion_dfs[clip_uuid]
+        n_horizons = self._wm_num_frames + 1  # current + N future
+        # Horizon egomotion timestamps: current + 1 Hz future steps. The valid-
+        # sample margins guarantee sample_idx + N*stride stays in-range.
+        rows = [min(sample_idx + h * self._wm_stride, len(df_ds) - 1)
+                for h in range(n_horizons)]
+        ts_us = [int(df_ds.iloc[r]["timestamp"]) for r in rows]
+        cam_ts = self._camera_timestamps.get((clip_uuid, self._front_cam))
+        return load_front_clip(
+            self.data_root, clip_uuid, ts_us,
+            front_cam=self._front_cam, camera_timestamps_us=cam_ts)
+
+    def sample_uid(self, idx: int) -> str:
+        """Global, partition-independent sample id (#121 §3.1).
+
+        Built from (clip_uuid, sample_idx) — stable regardless of which clips a
+        pod loaded — so the label<->pack JOIN and S3 cache survive clip-range
+        sharding. No `.`/`/` (safe as a WebDataset ``__key__``); clip_uuid is a
+        UUID (hex + `-`).
+        """
+        clip_uuid, sample_idx, _ts = self._samples[idx]
+        return f"nv-{UID_SCHEMA_VERSION}-{clip_uuid}-f{sample_idx:06d}"
+
+    def split_group_uid(self, idx: int) -> str:
+        """Train/val split unit (#121 §3.1): the whole CLIP (frames within a clip
+        are correlated, so they must not straddle train/val)."""
+        clip_uuid, _sample_idx, _ts = self._samples[idx]
+        return f"nv-{clip_uuid}"
+
+    def frame_index(self, idx: int) -> int:
+        """Clip-local sample index for sample ``idx`` — used to pick the reasoning
+        1 Hz subset (label iff ``frame_index % stride == 0``), a stable per-sample
+        function so the labeled subset is partition-independent (#121 §3.4d)."""
+        _clip_uuid, sample_idx, _ts = self._samples[idx]
+        return sample_idx
+
     def __len__(self) -> int:
         return len(self._samples)
 
@@ -255,7 +357,6 @@ class NvidiaAVDataset(Dataset):
             self.data_root,
             clip_uuid,
             egomotion_timestamp_us=egomotion_timestamp_us,
-            transform=self.transform,
             camera_names=self.camera_names,
             camera_timestamps=camera_timestamps,
         )
@@ -267,8 +368,14 @@ class NvidiaAVDataset(Dataset):
             df=self._egomotion_dfs[clip_uuid],
         )
 
+        # NVIDIA has no rendered nav-map; the map branch gets a zero tile shaped
+        # like one camera frame. Kept separate from visual_tiles so it never
+        # enters the camera BEV projection.
+        map_tile = make_map_tile(visual_tiles[0])
+
         return ClipSample(
             visual_tiles=visual_tiles,
+            map_tile=map_tile,
             visual_history=torch.zeros(_VISUAL_HISTORY_DIM),
             egomotion_history=egomotion_history,
             trajectory_target=trajectory_target,

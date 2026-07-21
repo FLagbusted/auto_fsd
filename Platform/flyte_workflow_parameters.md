@@ -71,14 +71,14 @@ Each dataset stays a **separately-packed** WebDataset.
 
 | Aspect | Detail |
 |--------|--------|
-| Inputs | `shards: List[FlyteDirectory]` (all datasets), `dataset: Dataset` (selects which), `backbone`, `fusion_mode`, `epochs`, `batch_size`, `lr`, `weight_decay`, `grad_clip`, `amp` |
+| Inputs | `shards: List[FlyteDirectory]` (all datasets), `dataset: Dataset` (selects which), `backbone`, `epochs`, `batch_size`, `lr`, `weight_decay`, `grad_clip`, `amp` |
 | Output | `TrainOutput(checkpoint: FlyteFile, metadata: FlyteFile)` |
 | Resources | cpu=4, mem=16Gi, gpu=1 |
 
 **Behavior**:
 - `_select_shard_dir` picks the shard dir whose `manifest.json` matches `dataset`.
 - `num_views` is **detected from the data** (peek first batch) so the model matches the dataset's camera count.
-- Builds `AutoE2E(backbone, fusion_mode, num_views, ...)`, trains with `TrajectoryImitationLoss` (smooth-L1), AdamW, AMP (bf16), grad clipping.
+- Builds `AutoE2E(backbone, num_views, ...)` (BEV fusion is hardcoded since PR #94; no `fusion_mode` arg), trains with `TrajectoryImitationLoss` (smooth-L1), AdamW, AMP (bf16), grad clipping. A zero `map_input` is fed since shards carry no rendered nav-map yet (#77).
 - Saves checkpoint (`model_state_dict` + config) and a `metadata.json` capturing full provenance: data, model, training hyperparams, Flyte execution id, docker image.
 - **Does NOT log to MLflow** — that is the eval task's job (single point of truth).
 
@@ -134,11 +134,40 @@ eval metrics, `config.yaml` + checkpoint artifacts, and registers the model in
 Single task. Params: `dataset`, `episodes`. Output: raw `FlyteDirectory`.
 
 ### `wf_data_processing`
-Params: `raw_data` (URI from a prior ingest), `dataset`, `hz`, `image_size`, `episodes`.
-Output: WebDataset shards `FlyteDirectory`.
+Pure deterministic packing (no teacher call). Params: `raw_data` (URI from a prior
+ingest), `dataset`, `hz`, `image_size`, `episodes`, `world_model`,
+`reasoning_labels` (optional URI from `wf_generate_reasoning_labels`). When
+`reasoning_labels` is set, each sample's frozen label is JOINed in by `sample_id`
+and embedded as a `reasoning.json` shard member. Output: WebDataset shards
+`FlyteDirectory`.
+
+### `wf_generate_reasoning_labels`
+The single place the offline teacher (Cosmos) is called. Params: `raw_data`,
+`dataset`, `episodes`, `split`, `teacher` (`openai_compatible` / `mock` /
+`cached`), `prompt_version`. Enumerates samples from raw (same parser/episodes as
+`wf_data_processing`, so `sample_id` matches), calls the teacher only on a
+`LabelCache` miss (sample_id-keyed in `REASONING_LABELS_CACHE_BUCKET`, so re-packing
+never re-bills the endpoint, #98/#117), and writes a versioned label artifact
+(whole-record `records.jsonl` for the JOIN + flattened parquet/jsonl for
+analytics). Output: label `FlyteDirectory`.
+
+### `wf_create_dataset`
+`data_ingest → [reasoning_teacher != none] generate_reasoning_labels →
+data_processing (JOIN labels)`. Produces the ready-to-train shards in one shot.
+Params: `dataset`, `episodes`, `image_size`, `world_model`, `reasoning_teacher`,
+`prompt_version`. Output: WebDataset shards `FlyteDirectory` (the shards ARE the
+dataset; the label artifact persists independently via the generate task output +
+the cache, so it is not a separate return value).
 
 ### `wf_train_il`
-`train_il → evaluate_il_policy`. Params: `shards` (list), `dataset`, `backbone`, `fusion_mode`, `epochs`, `batch_size`, `lr`. Logs to `imitation-learning`.
+`train_il → evaluate_il_policy`. Params: `shards` (list), `dataset`, `backbone`, `epochs`, `batch_size`, `lr`. Logs to `imitation-learning`.
+
+### `wf_ingest_train_eval`
+`data_ingest + data_processing (all datasets) → train_il → evaluate_il_policy`.
+Same as `wf_full_pipeline` but stops after IL evaluation (no offline RL). Use when
+you only need a supervised checkpoint + open-loop metrics, or when the RL step is
+too memory-hungry at the current BEV resolution (#77). Params: `dataset`,
+`episodes`, `backbone`, `epochs_il`, `batch_size`, `lr`.
 
 ### `wf_train_offline_rl`
 `train_offline_rl → evaluate_rl_policy`. Params: `pretrained`, `shards`, `il_metadata`, `dataset`, `epochs`, `tau`, `beta`. Logs to `offline-rl`.
@@ -152,7 +181,6 @@ IL train+eval and RL train+eval on the dataset selected by `dataset`.
 | `dataset` | `L2D` | which processed dataset to train on |
 | `episodes` | 3 | episodes per dataset to ingest |
 | `backbone` | `SWIN_V2_TINY` | image encoder |
-| `fusion_mode` | `CONCAT` | view fusion (concat / cross_attn / bev) |
 | `epochs_il` | 3 | IL training epochs |
 | `epochs_rl` | 3 | RL refinement epochs |
 | `batch_size` | 4 | |
@@ -179,7 +207,9 @@ HF token is **not** a parameter — it is injected from the `hf-token` K8s Secre
 |------|-----------------|
 | `Dataset` | `yaak-ai/L2D`, `nvidia/PhysicalAI-Autonomous-Vehicles` |
 | `Backbone` | `swin_v2_tiny`, `conv_next_v2_tiny`, `res_net_50` |
-| `FusionMode` | `concat`, `cross_attn`, `bev` |
+
+View fusion is no longer an enum/parameter: BEV fusion is hardcoded in the model
+since PR #94 (concat / cross_attn were removed).
 
 > When launching via the raw Admin API, pass the **enum value** (e.g.
 > `nvidia/PhysicalAI-Autonomous-Vehicles`), not the enum name.
