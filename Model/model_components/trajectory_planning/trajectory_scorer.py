@@ -27,11 +27,14 @@ terms, so it can be merged and evaluated without retraining the perception
 or planner stack — it only changes *how many* samples are drawn from an
 already-trained stochastic planner and *how* the best one is picked.
 
-Calibration: `meters_per_pixel`, `ego_row`, `ego_col` below come directly
-from `Model.navigation.geometry.DEFAULT_NAVIGATION_GEOMETRY` — the actual
-geometry `map_context` is rasterized with (#161, merged, resolved #148/#149).
-This is no longer a guess to verify; it's imported from the same source of
-truth the renderer itself uses. Drivable-area compliance reads
+Calibration: `meters_per_pixel`, `ego_row`, `ego_col` below default to
+`Model.navigation.geometry.AUTOE2E_NAVIGATION_GEOMETRY`
+(`autoe2e-bev-450x300-0p4m-v1`) — the raster the Reactive training, evaluation
+and v1.0 release pipelines actually produce `map_context` in. For any other
+raster, build the config with `ScorerConfig.from_geometry(...)`.
+`drivable_area_compliance` rejects a `map_context` whose shape does not match
+the configured geometry, because a wrong calibration otherwise indexes the
+wrong pixels without any error. Drivable-area compliance reads
 `map_context`'s `MapChannel.DRIVABLE_AREA` channel directly — a real
 binary semantic mask, not a pixel-colour heuristic on a human-viewable
 image (map_context is 14 semantic channels now, not a rendered RGB image).
@@ -45,25 +48,29 @@ import torch
 import torch.nn as nn
 
 from Model.evaluation.metrics import integrate_trajectory
-from Model.navigation.geometry import DEFAULT_NAVIGATION_GEOMETRY, MapChannel
+from Model.navigation.geometry import (
+    AUTOE2E_NAVIGATION_GEOMETRY,
+    MapChannel,
+    NavigationRasterGeometry,
+)
 
 
 @dataclass
 class ScorerConfig:
     # --- BEV pixel-space calibration ---
-    # Sourced directly from Model.navigation.geometry.DEFAULT_NAVIGATION_GEOMETRY
-    # (geometry_id="kitscenes-v3-bev-1m-v1") — the same geometry map_context
-    # is actually rasterized with, not a guessed/reverse-engineered value.
-    # This resolves the #148/#149 calibration risk this module used to warn
-    # about: those issues are merged (see #161), and this is their real
-    # output geometry, not a placeholder.
-    meters_per_pixel: float = DEFAULT_NAVIGATION_GEOMETRY.meters_per_pixel
-    bev_h: int = DEFAULT_NAVIGATION_GEOMETRY.height_px
-    bev_w: int = DEFAULT_NAVIGATION_GEOMETRY.width_px
-    x_max_m: float = DEFAULT_NAVIGATION_GEOMETRY.x_max_m
-    y_max_m: float = DEFAULT_NAVIGATION_GEOMETRY.y_max_m
-    ego_row: float = DEFAULT_NAVIGATION_GEOMETRY.ego_anchor_row
-    ego_col: float = DEFAULT_NAVIGATION_GEOMETRY.ego_anchor_col
+    # Defaults to AUTOE2E_NAVIGATION_GEOMETRY (450 x 300 px at 0.4 m,
+    # x in [-60, 120] m), the geometry the Reactive pipelines and the v1.0
+    # release rasterize map_context with. Previously this read
+    # DEFAULT_NAVIGATION_GEOMETRY (256 x 256 px at 1.0 m), which silently
+    # projected every waypoint onto the wrong pixels for release data. Use
+    # ScorerConfig.from_geometry() for a different raster.
+    meters_per_pixel: float = AUTOE2E_NAVIGATION_GEOMETRY.meters_per_pixel
+    bev_h: int = AUTOE2E_NAVIGATION_GEOMETRY.height_px
+    bev_w: int = AUTOE2E_NAVIGATION_GEOMETRY.width_px
+    x_max_m: float = AUTOE2E_NAVIGATION_GEOMETRY.x_max_m
+    y_max_m: float = AUTOE2E_NAVIGATION_GEOMETRY.y_max_m
+    ego_row: float = AUTOE2E_NAVIGATION_GEOMETRY.ego_anchor_row
+    ego_col: float = AUTOE2E_NAVIGATION_GEOMETRY.ego_anchor_col
 
     # --- drivable-area lookup ---
     # map_context's DRIVABLE_AREA channel (Model.navigation.geometry.MapChannel)
@@ -89,6 +96,21 @@ class ScorerConfig:
     # --- selection mode ---
     selection: str = "nearest"             # "nearest" (argmax) or "mean" (softmax blend)
     softmax_temperature: float = 1.0
+
+    @classmethod
+    def from_geometry(cls, geometry: NavigationRasterGeometry,
+                      **overrides) -> "ScorerConfig":
+        """Calibrate from the NavigationRasterGeometry map_context uses."""
+        return cls(
+            meters_per_pixel=geometry.meters_per_pixel,
+            bev_h=geometry.height_px,
+            bev_w=geometry.width_px,
+            x_max_m=geometry.x_max_m,
+            y_max_m=geometry.y_max_m,
+            ego_row=geometry.ego_anchor_row,
+            ego_col=geometry.ego_anchor_col,
+            **overrides,
+        )
 
 
 def extract_initial_speed(egomotion_history: torch.Tensor) -> torch.Tensor:
@@ -222,6 +244,12 @@ def drivable_area_compliance(xy: torch.Tensor, map_context: torch.Tensor,
             pixel and within the raster's bounds.
     """
     B, _, H, W = map_context.shape
+    if (H, W) != (config.bev_h, config.bev_w):
+        raise ValueError(
+            f"map_context is {H}x{W} but the scorer is calibrated for "
+            f"{config.bev_h}x{config.bev_w}; build the config with "
+            "ScorerConfig.from_geometry(<the map's NavigationRasterGeometry>)."
+        )
     T = xy.shape[1]
     pixels = project_xy_to_bev_pixel(xy, config)  # [B, T, 2]
 

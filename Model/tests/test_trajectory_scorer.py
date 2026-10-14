@@ -24,13 +24,18 @@ from Model.model_components.trajectory_planning.trajectory_scorer import (
     kinematic_comfort_score,
     project_xy_to_bev_pixel,
 )
-from Model.navigation.geometry import DEFAULT_NAVIGATION_GEOMETRY, MapChannel
+from Model.navigation.geometry import (
+    AUTOE2E_NAVIGATION_GEOMETRY,
+    DEFAULT_NAVIGATION_GEOMETRY,
+    MapChannel,
+)
 
 NUM_TIMESTEPS = 4
 BATCH = 2
-# Real geometry (#161), not a guessed shape — see ScorerConfig's own defaults.
-BEV_H = DEFAULT_NAVIGATION_GEOMETRY.height_px
-BEV_W = DEFAULT_NAVIGATION_GEOMETRY.width_px
+# The raster the Reactive pipelines / v1.0 release produce map_context in,
+# which is what ScorerConfig defaults to.
+BEV_H = AUTOE2E_NAVIGATION_GEOMETRY.height_px
+BEV_W = AUTOE2E_NAVIGATION_GEOMETRY.width_px
 NAV_CHANNELS = 14  # Model.navigation.geometry.MAP_CHANNEL_COUNT
 DEFAULT_SPEED = 5.0  # m/s, used to build realistic-looking egomotion fixtures
 
@@ -141,12 +146,12 @@ class TestDecodeTrajectoryToXY:
 
 class TestProjectXYToBEVPixel:
     def test_ego_origin_maps_correctly(self):
-        """Must match DEFAULT_NAVIGATION_GEOMETRY.ego_to_pixel exactly —
+        """Must match AUTOE2E_NAVIGATION_GEOMETRY.ego_to_pixel exactly —
         this is a reimplementation of that method for batched torch use,
         not an independent formula, so cross-check against it directly."""
         cfg = ScorerConfig()
         px = project_xy_to_bev_pixel(torch.zeros(1, 2), cfg)
-        expected = DEFAULT_NAVIGATION_GEOMETRY.ego_to_pixel(np.zeros((1, 2)))
+        expected = AUTOE2E_NAVIGATION_GEOMETRY.ego_to_pixel(np.zeros((1, 2)))
         assert px[0, 0].item() == round(expected[0, 0])
         assert px[0, 1].item() == round(expected[0, 1])
         assert px[0, 0].item() == round(cfg.ego_row)
@@ -163,7 +168,7 @@ class TestProjectXYToBEVPixel:
         NavigationRasterGeometry.ego_to_pixel to the pixel."""
         cfg = ScorerConfig()
         pts = np.array([[10.0, -5.0], [-20.0, 30.0], [0.0, 50.0]])
-        expected = DEFAULT_NAVIGATION_GEOMETRY.ego_to_pixel(pts)
+        expected = AUTOE2E_NAVIGATION_GEOMETRY.ego_to_pixel(pts)
         got = project_xy_to_bev_pixel(torch.tensor(pts, dtype=torch.float64), cfg)
         for i in range(len(pts)):
             assert got[i, 0].item() == round(expected[i, 0])
@@ -279,3 +284,50 @@ if __name__ == "__main__":
     print(f"  scores:      {tuple(scores.shape)}")
     print(f"  score range: {scores.min().item():.3f} - {scores.max().item():.3f}")
     print("PASSED.")
+
+
+class TestScorerGeometry:
+    """The scorer must index map_context in the geometry it was rasterized
+    with; a mismatch must fail loudly rather than read the wrong pixels."""
+
+    def test_default_is_release_geometry(self):
+        cfg = ScorerConfig()
+        g = AUTOE2E_NAVIGATION_GEOMETRY
+        assert (cfg.bev_h, cfg.bev_w) == (g.height_px, g.width_px)
+        assert cfg.meters_per_pixel == g.meters_per_pixel
+        assert (cfg.x_max_m, cfg.y_max_m) == (g.x_max_m, g.y_max_m)
+        assert (cfg.ego_row, cfg.ego_col) == (g.ego_anchor_row, g.ego_anchor_col)
+
+    def test_from_geometry_matches_that_geometry(self):
+        g = DEFAULT_NAVIGATION_GEOMETRY
+        cfg = ScorerConfig.from_geometry(g, selection="mean")
+        pts = np.array([[10.0, -5.0], [-20.0, 30.0], [40.0, 0.0]])
+        expected = g.ego_to_pixel(pts)
+        got = project_xy_to_bev_pixel(torch.tensor(pts, dtype=torch.float64), cfg)
+        for i in range(len(pts)):
+            assert got[i, 0].item() == round(expected[i, 0])
+            assert got[i, 1].item() == round(expected[i, 1])
+        assert cfg.selection == "mean"
+
+    def test_mismatched_map_shape_raises(self):
+        wrong = torch.zeros(1, NAV_CHANNELS, DEFAULT_NAVIGATION_GEOMETRY.height_px,
+                            DEFAULT_NAVIGATION_GEOMETRY.width_px)
+        with pytest.raises(ValueError, match="calibrated for"):
+            drivable_area_compliance(torch.zeros(1, NUM_TIMESTEPS, 2), wrong, ScorerConfig())
+
+    def test_straight_ahead_on_release_raster_lane_is_compliant(self):
+        """A lane drawn through the release geometry's own ego_to_pixel must
+        score as fully drivable for a straight-ahead path, and an identical
+        path shifted 10 m left must not."""
+        g = AUTOE2E_NAVIGATION_GEOMETRY
+        m = torch.zeros(1, NAV_CHANNELS, g.height_px, g.width_px)
+        lane = g.ego_to_pixel(np.array([[60.0, 1.75], [-5.0, -1.75]]))
+        r0, r1 = int(np.floor(lane[0, 0])), int(np.ceil(lane[1, 0]))
+        c0, c1 = int(np.floor(lane[0, 1])), int(np.ceil(lane[1, 1]))
+        m[0, MapChannel.DRIVABLE_AREA, r0:r1 + 1, c0:c1 + 1] = 1.0
+        xs = torch.linspace(0.0, 50.0, NUM_TIMESTEPS)
+        straight = torch.stack([xs, torch.zeros_like(xs)], dim=-1)[None]
+        shifted = straight + torch.tensor([0.0, 10.0])
+        cfg = ScorerConfig()
+        assert drivable_area_compliance(straight, m, cfg).item() == 1.0
+        assert drivable_area_compliance(shifted, m, cfg).item() == 0.0
