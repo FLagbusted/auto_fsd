@@ -1248,9 +1248,16 @@ class ReactiveE2E(nn.Module):
                 compute_bev_segmentation=True,
                 compute_route_reconstruction=True,
                 bev_only=False,
+                return_planner_loss=False,
                 **kwargs):
         """
         Run the reactive end-to-end autonomous-driving pipeline.
+
+        ``return_planner_loss=True`` (train mode only) also runs the planner's
+        own training objective, ``compute_planner_loss``, on the same planner
+        inputs and returns it as ``aux_outputs["planner_loss"]``. Required for
+        planners whose ``forward()`` output must not be regressed directly
+        (flow_matching); requires ``trajectory_target``.
 
 
         Args:
@@ -1610,6 +1617,27 @@ class ReactiveE2E(nn.Module):
         )
         if reasoning_pred is not None and mode == "train":
             aux_outputs["reasoning_pred"] = reasoning_pred
+        if return_planner_loss and mode == "train":
+            compute_planner_loss = getattr(
+                self.TrajectoryPlanner, "compute_planner_loss", None,
+            )
+            if compute_planner_loss is None:
+                raise ValueError(
+                    f"return_planner_loss=True but planner_mode="
+                    f"{self.planner_mode!r} defines no compute_planner_loss; "
+                    "train it with a trajectory loss on forward() instead."
+                )
+            trajectory_target = kwargs.get("trajectory_target")
+            if trajectory_target is None:
+                raise ValueError(
+                    "return_planner_loss=True requires trajectory_target."
+                )
+            aux_outputs["planner_loss"] = compute_planner_loss(
+                planner_features, visual_ctx, ego_ctx,
+                trajectory_target,
+                reasoning_latent=reasoning_latent,
+                reasoning_horizon_tokens=reasoning_horizon_tokens,
+            )
         result = (trajectory, aux_outputs) if aux_outputs else trajectory
 
         if camera_fpn_cache is not None:

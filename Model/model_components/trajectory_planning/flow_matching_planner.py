@@ -343,6 +343,53 @@ class FlowMatchingPlanner(BasePlanner):
         velocity_seq = self.velocity_head(modulated)             # [B, T, S]
         return velocity_seq.reshape(B, self.trajectory_dim)
 
+    def compute_planner_loss(self, bev_features, visual_history,
+                             egomotion_history, trajectory_target,
+                             reasoning_latent=None,
+                             reasoning_horizon_tokens=None, **kwargs):
+        """Training objective: velocity MSE (rectified flow, Lipman et al. 2023).
+
+        Samples ``(u_t, t, x_1 - x_0)`` via ``construct_training_data`` and
+        regresses ``v_theta(u_t, t, c)`` onto the target velocity. This is the
+        objective ``forward()`` was designed against; regressing ``forward()``'s
+        Euler-from-noise rollout onto the target instead (what a generic
+        trajectory loss does) trains the network toward the conditional mean.
+
+        Conditioning (BEV projection, visual/ego modulation, reasoning
+        coupling) goes through exactly the same helpers as ``forward()``, so a
+        model trained here is evaluated by ``forward()`` without drift.
+
+        Args:
+            bev_features: [B, embed_dim, H, W].
+            visual_history: [B, visual_history_dim].
+            egomotion_history: [B, egomotion_dim].
+            trajectory_target: [B, trajectory_dim] — the (accel, curvature)
+                controls ``forward()`` is trained to reproduce.
+            reasoning_latent / reasoning_horizon_tokens: as in ``forward()``.
+            **kwargs: ignored, so call sites can stay planner-agnostic.
+
+        Returns:
+            Scalar loss. The raw velocity never leaves this method, per the
+            ``BasePlanner`` train/infer split.
+        """
+        self._validate_inputs(visual_history, egomotion_history)
+        B = bev_features.shape[0]
+        self._validate_trajectory_target(
+            trajectory_target, B, bev_features.device,
+        )
+        trajectory_target = trajectory_target.to(bev_features.dtype)
+        mod_cond = self._modulation_conditioning(
+            visual_history, egomotion_history,
+            reasoning_latent=reasoning_latent,
+        )
+        bev_seq = self._project_bev(bev_features)
+        u_t, t, target_velocity = self.construct_training_data(trajectory_target)
+        predicted_velocity = self._v_theta(
+            u_t, t, bev_seq, mod_cond,
+            horizon_tokens=reasoning_horizon_tokens,
+        )
+        return nn.functional.mse_loss(predicted_velocity, target_velocity)
+
     def forward(self, bev_features, visual_history, egomotion_history,
                 generator=None, initial_noise=None, reasoning_latent=None,
                 reasoning_horizon_tokens=None, **kwargs):

@@ -3795,6 +3795,10 @@ def train_il(
     # Defaults to the previously hardcoded value, so a run that does not pass it
     # is unchanged.
     map_fusion_mode: MapFusion = MapFusion.RESIDUAL,
+    # "bezier" (default, unchanged behaviour) or "flow_matching". Flow matching
+    # is trained on its own velocity objective (compute_planner_loss), never
+    # by regressing its Euler-from-noise forward() output.
+    planner_mode: str = "bezier",
     epochs: int = 3,
     batch_size: int = 4,
     # Effective batch size = batch_size * grad_accum_steps. The World-Model
@@ -3911,6 +3915,23 @@ def train_il(
         )
     if epochs <= 0:
         raise ValueError(f"epochs must be positive, got {epochs}")
+    if planner_mode not in {"bezier", "flow_matching"}:
+        raise ValueError(
+            "planner_mode must be 'bezier' or 'flow_matching', "
+            f"got {planner_mode!r}"
+        )
+    if planner_mode == "flow_matching" and (
+        training_objective_version != BASELINE_TRAINING_OBJECTIVE_VERSION
+        or enable_route_consistency
+    ):
+        # The navigation / rollout-aligned objectives regress forward()'s
+        # rollout and their gradient budgets are calibrated against the
+        # SmoothL1 trajectory loss; neither has been validated against the
+        # flow velocity objective.
+        raise ValueError(
+            "planner_mode='flow_matching' currently supports only the "
+            "baseline training objective without route consistency"
+        )
     if training_objective_version not in {
         BASELINE_TRAINING_OBJECTIVE_VERSION,
         KITSCENES_NAVIGATION_OBJECTIVE_VERSION,
@@ -4652,7 +4673,9 @@ def train_il(
         map_fusion_mode=mfm,
         enable_reasoning=enable_reasoning, reasoning_mode=reasoning_mode,
         enable_world_model=enable_world_model,
+        planner_mode=planner_mode,
     ).to(device)
+    print(f"Planner: {planner_mode}")
     print(f"Reasoning: {'on' if enable_reasoning else 'off'}"
           + (f" (mode={reasoning_mode})" if enable_reasoning else ""))
     print(f"World Model: {'on' if enable_world_model else 'off'}")
@@ -4785,6 +4808,11 @@ def train_il(
         "enable_reasoning": enable_reasoning,
         "reasoning_mode": reasoning_mode,
         "enable_world_model": enable_world_model,
+        # Only recorded when non-default: resume compares a digest of this
+        # whole dict, so adding the key unconditionally would make every
+        # existing bezier checkpoint un-resumable. Absent => AutoE2E default
+        # ("bezier"), which is exactly what those checkpoints were trained as.
+        **({"planner_mode": planner_mode} if planner_mode != "bezier" else {}),
         "optimizer": "AdamW",
         "lr": lr,
         "training_seed": training_seed,
@@ -5595,11 +5623,18 @@ def train_il(
                             route_valid=route_valid,
                             projection=proj_dev, geometry_type=batch_geom,
                             mode="train", trajectory_target=target,
-                            history_frames=history_frames, future_frames=future_frames)
+                            history_frames=history_frames, future_frames=future_frames,
+                            return_planner_loss=planner_mode == "flow_matching")
                 # Train mode returns (trajectory, aux) when a branch (reasoning /
                 # world model) is on; otherwise just the trajectory tensor.
                 trajectory, aux = out if isinstance(out, tuple) else (out, {})
-                traj_loss = loss_fn(trajectory, target)
+                if planner_mode == "flow_matching":
+                    # Velocity-MSE flow objective. Regressing `trajectory` (an
+                    # Euler rollout from fresh noise) with loss_fn would train
+                    # the planner toward the conditional mean instead.
+                    traj_loss = aux["planner_loss"]
+                else:
+                    traj_loss = loss_fn(trajectory, target)
                 loss = traj_loss
                 initial_speed = ego_hist.reshape(
                     ego_hist.shape[0],
@@ -10240,6 +10275,7 @@ def wf_train_il(
     dataset: Dataset = Dataset.L2D,
     backbone: Backbone = Backbone.SWIN_V2_TINY,
     map_fusion_mode: MapFusion = MapFusion.RESIDUAL,
+    planner_mode: str = "bezier",
     epochs: int = 3,
     batch_size: int = 4,
     grad_accum_steps: int = 1,
@@ -10284,6 +10320,7 @@ def wf_train_il(
     """
     out = train_il(shards=shards, dataset=dataset, backbone=backbone,
                    map_fusion_mode=map_fusion_mode,
+                   planner_mode=planner_mode,
                    epochs=epochs, batch_size=batch_size,
                    grad_accum_steps=grad_accum_steps, lr=lr,
                    training_seed=training_seed, amp=amp,
