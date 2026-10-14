@@ -122,6 +122,15 @@ class FlowMatchingPlanner(BasePlanner):
         # Per-timestep action token projection: each (acc, curv) pair becomes
         # an embed_dim query.
         self.action_proj = nn.Linear(num_signals, embed_dim)
+        # Learned horizon-position embedding, one per future timestep. Without
+        # it the T action tokens are indistinguishable (shared projection, and
+        # the BEV keys/values carry no horizon index), so the velocity field
+        # can only express targets that are constant over the horizon — any
+        # accel/curvature profile that changes over time is unlearnable.
+        self.action_pos_embed = nn.Parameter(
+            torch.zeros(1, num_timesteps, embed_dim)
+        )
+        nn.init.normal_(self.action_pos_embed, std=0.02)
         self.bev_kv_proj = nn.Linear(embed_dim, embed_dim)
 
         self.cross_attn = nn.MultiheadAttention(
@@ -312,7 +321,7 @@ class FlowMatchingPlanner(BasePlanner):
 
         # Action queries: one token per future timestep.
         u_t_seq = u_t.reshape(B, self.num_timesteps, self.num_signals)
-        queries = self.action_proj(u_t_seq)                      # [B, T, C]
+        queries = self.action_proj(u_t_seq) + self.action_pos_embed  # [B, T, C]
 
         # Horizon-aware reasoning: action queries attend the 5 horizon tokens.
         # Zero-init residual (no-op at init); only fires in cross-attention mode
